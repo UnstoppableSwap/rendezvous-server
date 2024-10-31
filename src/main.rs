@@ -1,20 +1,16 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use futures::{AsyncRead, AsyncWrite, StreamExt};
 use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::transport::Boxed;
-use libp2p::core::upgrade::{SelectUpgrade, Version};
-use libp2p::dns::TokioDnsConfig;
+use libp2p::core::upgrade::Version;
 use libp2p::identity::ed25519;
-use libp2p::mplex::MplexConfig;
-use libp2p::noise::{NoiseConfig, X25519Spec};
-use libp2p::ping::{Ping, PingConfig, PingEvent};
-use libp2p::swarm::toggle::Toggle;
-use libp2p::swarm::{SwarmBuilder, SwarmEvent};
-use libp2p::tcp::TokioTcpConfig;
-use libp2p::websocket::tls::{Certificate, PrivateKey};
-use libp2p::websocket::{tls, WsConfig};
-use libp2p::yamux::YamuxConfig;
-use libp2p::{identity, noise, rendezvous, Multiaddr, PeerId, Swarm, Transport};
+use libp2p::noise;
+use libp2p::rendezvous::server::Behaviour;
+use libp2p::swarm::SwarmEvent;
+use libp2p::tcp;
+use libp2p::yamux;
+use libp2p::{dns, SwarmBuilder};
+use libp2p::{identity, rendezvous, Multiaddr, PeerId, Swarm, Transport};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -48,23 +44,6 @@ struct Cli {
     /// timestamped, e.g. through journald.
     #[structopt(long)]
     no_timestamp: bool,
-
-    /// Compose the ping behaviour together with the rendezvous behaviour in
-    /// case a rendezvous server with Ping is required. This feature will be removed once https://github.com/libp2p/rust-libp2p/issues/2109 is fixed.
-    #[structopt(long)]
-    ping: bool,
-    /// Port used for listening on websocket
-    #[structopt(long)]
-    listen_websocket: Option<u16>,
-
-    /// Path to server private key for secure websocket connection
-    /// configuration.
-    #[structopt(long)]
-    tls_private_key: Option<PathBuf>,
-    /// Path to server SSL certificate for secure websocket connection
-    /// configuration.
-    #[structopt(long)]
-    tls_certificate: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -82,23 +61,10 @@ async fn main() -> Result<()> {
         }
         false => load_secret_key_from_file(&cli.secret_file).await?,
     };
-    let identity = identity::Keypair::Ed25519(secret_key.into());
 
-    let tls_config = tls_config_from_params(
-        cli.tls_private_key,
-        cli.tls_certificate,
-        cli.listen_websocket.is_some(),
-    )
-    .await?;
+    let identity = identity::Keypair::from(ed25519::Keypair::from(secret_key));
 
-    let ws_or_wss = if tls_config.is_some() { "wss" } else { "ws" };
-
-    let mut swarm = create_swarm(
-        identity,
-        cli.ping,
-        cli.listen_websocket.is_some(),
-        tls_config,
-    )?;
+    let mut swarm = create_swarm(identity)?;
 
     tracing::info!(peer_id=%swarm.local_peer_id(), "Rendezvous server peer id");
 
@@ -110,76 +76,43 @@ async fn main() -> Result<()> {
         )
         .context("Failed to initialize listener")?;
 
-    if let Some(websocket_port) = cli.listen_websocket {
-        swarm
-            .listen_on(
-                format!("/ip4/0.0.0.0/tcp/{}/{}", websocket_port, ws_or_wss)
-                    .parse()
-                    .unwrap(),
-            )
-            .context("Failed to initialize websocket listener")?;
-    }
-
     loop {
         match swarm.select_next_some().await {
-            SwarmEvent::Behaviour(Event::Rendezvous(
-                rendezvous::server::Event::PeerRegistered { peer, registration },
-            )) => {
+            SwarmEvent::Behaviour(rendezvous::server::Event::PeerRegistered {
+                peer,
+                registration,
+            }) => {
                 tracing::info!(%peer, namespace=%registration.namespace, addresses=?registration.record.addresses(), ttl=registration.ttl,  "Peer registered");
             }
-            SwarmEvent::Behaviour(Event::Rendezvous(
-                rendezvous::server::Event::PeerNotRegistered {
-                    peer,
-                    namespace,
-                    error,
-                },
-            )) => {
+            SwarmEvent::Behaviour(rendezvous::server::Event::PeerNotRegistered {
+                peer,
+                namespace,
+                error,
+            }) => {
                 tracing::info!(%peer, %namespace, ?error, "Peer failed to register");
             }
-            SwarmEvent::Behaviour(Event::Rendezvous(
-                rendezvous::server::Event::RegistrationExpired(registration),
-            )) => {
+            SwarmEvent::Behaviour(rendezvous::server::Event::RegistrationExpired(registration)) => {
                 tracing::info!(peer=%registration.record.peer_id(), namespace=%registration.namespace, addresses=%Addresses(registration.record.addresses()), ttl=registration.ttl, "Registration expired");
             }
-            SwarmEvent::Behaviour(Event::Rendezvous(
-                rendezvous::server::Event::PeerUnregistered { peer, namespace },
-            )) => {
+            SwarmEvent::Behaviour(rendezvous::server::Event::PeerUnregistered {
+                peer,
+                namespace,
+            }) => {
                 tracing::info!(%peer, %namespace, "Peer unregistered");
             }
-            SwarmEvent::Behaviour(Event::Rendezvous(
-                rendezvous::server::Event::DiscoverServed { enquirer, .. },
-            )) => {
+            SwarmEvent::Behaviour(rendezvous::server::Event::DiscoverServed {
+                enquirer, ..
+            }) => {
                 tracing::info!(peer=%enquirer, "Discovery served");
             }
             SwarmEvent::NewListenAddr { address, .. } => {
                 tracing::info!(%address, "New listening address reported");
             }
-            _ => {}
+            other => {
+                tracing::debug!(?other, "Unhandled event");
+            }
         }
     }
-}
-
-async fn tls_config_from_params(
-    private_key: Option<PathBuf>,
-    certificate: Option<PathBuf>,
-    websocket: bool,
-) -> Result<Option<tls::Config>> {
-    let (pk, cert) = match (private_key, certificate) {
-        (None, None) => return Ok(None),
-        (Some(pk), Some(cert)) => (pk, cert),
-        _ => bail!("Server private key and certificate both have to be provided"),
-    };
-    if !websocket {
-        tracing::warn!("The provided SSL parameters won't have any affect, because you did not activate websockets");
-        return Ok(None);
-    }
-    let pk = fs::read(pk).await?;
-    let cert = fs::read(cert).await?;
-    let pk = PrivateKey::new(pk);
-    let cert = Certificate::new(cert);
-    let tls_config = tls::Config::new(pk, vec![cert])?;
-
-    Ok(Some(tls_config))
 }
 
 fn init_tracing(level: LevelFilter, json_format: bool, no_timestamp: bool) {
@@ -213,7 +146,7 @@ async fn load_secret_key_from_file(path: impl AsRef<Path>) -> Result<ed25519::Se
     let bytes = fs::read(path)
         .await
         .with_context(|| format!("No secret file at {}", path.display()))?;
-    let secret_key = ed25519::SecretKey::from_bytes(bytes)?;
+    let secret_key = ed25519::SecretKey::try_from_bytes(bytes)?;
 
     Ok(secret_key)
 }
@@ -243,48 +176,24 @@ async fn write_secret_key_to_file(secret_key: &ed25519::SecretKey, path: PathBuf
     Ok(())
 }
 
-fn create_swarm(
-    identity: identity::Keypair,
-    ping: bool,
-    websocket: bool,
-    tls: Option<tls::Config>,
-) -> Result<Swarm<Behaviour>> {
-    let local_peer_id = identity.public().to_peer_id();
-
-    let transport =
-        create_transport(&identity, websocket, tls).context("Failed to create transport")?;
+fn create_swarm(identity: identity::Keypair) -> Result<Swarm<Behaviour>> {
+    let transport = create_transport(&identity).context("Failed to create transport")?;
     let rendezvous = rendezvous::server::Behaviour::new(rendezvous::server::Config::default());
-    let swarm = SwarmBuilder::new(transport, Behaviour::new(rendezvous, ping), local_peer_id)
-        .executor(Box::new(|f| {
-            tokio::spawn(f);
-        }))
+
+    let swarm = SwarmBuilder::with_existing_identity(identity)
+        .with_tokio()
+        .with_other_transport(|_| transport)?
+        .with_behaviour(|_| rendezvous)?
         .build();
 
     Ok(swarm)
 }
 
-fn create_transport(
-    identity: &identity::Keypair,
-    websocket: bool,
-    tls: Option<tls::Config>,
-) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {
-    let tcp_with_dns = TokioDnsConfig::system(TokioTcpConfig::new().nodelay(true)).unwrap();
+fn create_transport(identity: &identity::Keypair) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {
+    let tcp = tcp::tokio::Transport::new(tcp::Config::new().nodelay(true));
+    let tcp_with_dns = dns::tokio::Transport::system(tcp)?;
 
-    let transport = if websocket {
-        let mut websocket_with_dns = WsConfig::new(tcp_with_dns.clone());
-
-        if let Some(tls) = tls {
-            websocket_with_dns.set_tls_config(tls);
-        }
-
-        authenticate_and_multiplex(
-            tcp_with_dns.or_transport(websocket_with_dns).boxed(),
-            &identity,
-        )
-        .unwrap()
-    } else {
-        authenticate_and_multiplex(tcp_with_dns.boxed(), &identity).unwrap()
-    };
+    let transport = authenticate_and_multiplex(tcp_with_dns.boxed(), &identity).unwrap();
 
     Ok(transport)
 }
@@ -296,66 +205,17 @@ fn authenticate_and_multiplex<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let auth_upgrade = {
-        let noise_identity = noise::Keypair::<X25519Spec>::new().into_authentic(identity)?;
-        NoiseConfig::xx(noise_identity).into_authenticated()
-    };
-    let multiplex_upgrade = SelectUpgrade::new(YamuxConfig::default(), MplexConfig::new());
+    let noise_config = noise::Config::new(identity).unwrap();
 
     let transport = transport
         .upgrade(Version::V1)
-        .authenticate(auth_upgrade)
-        .multiplex(multiplex_upgrade)
+        .authenticate(noise_config)
+        .multiplex(yamux::Config::default())
         .timeout(Duration::from_secs(20))
         .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)))
         .boxed();
 
     Ok(transport)
-}
-
-#[derive(Debug)]
-enum Event {
-    Rendezvous(rendezvous::server::Event),
-    Ping(PingEvent),
-}
-
-impl From<rendezvous::server::Event> for Event {
-    fn from(event: rendezvous::server::Event) -> Self {
-        Event::Rendezvous(event)
-    }
-}
-
-impl From<PingEvent> for Event {
-    fn from(event: PingEvent) -> Self {
-        Event::Ping(event)
-    }
-}
-
-#[derive(libp2p::NetworkBehaviour)]
-#[behaviour(event_process = false)]
-#[behaviour(out_event = "Event")]
-struct Behaviour {
-    ping: Toggle<Ping>,
-    rendezvous: rendezvous::server::Behaviour,
-}
-
-impl Behaviour {
-    fn new(rendezvous: rendezvous::server::Behaviour, enable_ping: bool) -> Self {
-        let ping = Toggle::from(enable_ping.then(|| {
-            Ping::new(
-                PingConfig::new()
-                    .with_keep_alive(false)
-                    .with_interval(Duration::from_secs(86_400)),
-            )
-        }));
-
-        Self {
-            // TODO: Remove Ping behaviour once https://github.com/libp2p/rust-libp2p/issues/2109 is fixed
-            // interval for sending Ping set to 24 hours
-            ping,
-            rendezvous,
-        }
-    }
 }
 
 struct Addresses<'a>(&'a [Multiaddr]);
